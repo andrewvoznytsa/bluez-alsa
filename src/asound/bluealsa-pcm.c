@@ -38,6 +38,8 @@
 #include "shared/log.h"
 #include "shared/rt.h"
 
+#define NSEC_PER_SEC 1000000000
+
 
 struct bluealsa_pcm {
 	snd_pcm_ioplug_t io;
@@ -136,6 +138,27 @@ static void io_thread_cleanup(struct bluealsa_pcm *pcm) {
 }
 
 /**
+ * Some playback applications may start the PCM before they have written the
+ * first full period of audio data. To match the behavior of the ALSA hw
+ * plug-in we do not report an underrun in this case. Instead we pause the IO
+ * thread for the estimated time it should take for a real-time application to
+ * write the balance of the period. */
+static void playback_wait_first_period(snd_pcm_ioplug_t *io) {
+	struct bluealsa_pcm *pcm = io->private_data;
+	while (io->appl_ptr < pcm->avail_min &&
+	            (io->state == SND_PCM_STATE_RUNNING ||
+ 	             io->state == SND_PCM_STATE_PREPARED)) {
+		uint64_t nsec =
+		            (pcm->avail_min - io->appl_ptr) * NSEC_PER_SEC / io->rate;
+		struct timespec ts = {
+			.tv_sec = nsec / NSEC_PER_SEC,
+			.tv_nsec = nsec % NSEC_PER_SEC
+		};
+		nanosleep(&ts, NULL);
+	}
+}
+ 
+/**
  * IO thread, which facilitates ring buffer. */
 static void *io_thread(snd_pcm_ioplug_t *io) {
 
@@ -158,7 +181,10 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	}
 
 	/* Block I/O until a full period of frames is available. */
-	bool started = false;
+ 	if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+ 		debug2("Waiting for first period of frames");
+ 		playback_wait_first_period(io);
+ 	}
 
 	struct asrsync asrs;
 	asrsync_init(&asrs, io->rate);
@@ -166,40 +192,24 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	debug2("Starting IO loop: %d", pcm->ba_pcm_fd);
 	for (;;) {
 
-		int tmp;
-		switch (io->state) {
-		case SND_PCM_STATE_RUNNING:
-			/* Some playback applications may start the PCM before they have
-			 * written the first full period of audio data. To match the
-			 * behavior of the ALSA hw plug-in we do not report an underrun in
-			 * this case. Instead we pause the IO thread for the estimated time
-			 * it should take for a real-time application to write the balance
-			 * of the period. */
-			if (!started && io->stream == SND_PCM_STREAM_PLAYBACK) {
-				if (pcm->avail_min > io->appl_ptr) {
-					struct timespec ts = {
-						.tv_nsec = (pcm->avail_min - io->appl_ptr) * 1000000000 / io->rate };
-					debug2("IO thread started with insufficient frames - pausing for %ld ms", ts.tv_nsec / 1000000);
-					sigtimedwait(&sigset, NULL, &ts);
-					asrsync_init(&asrs, io->rate);
-					continue;
-				}
-				started = true;
-			}
-			break;
-		case SND_PCM_STATE_DRAINING:
-			break;
-		case SND_PCM_STATE_DISCONNECTED:
-			goto fail;
-		case SND_PCM_STATE_XRUN:
-			started = false;
-			/* fall-through */
-		default:
+		if (pcm->io_ptr == -1 || io->state == SND_PCM_STATE_PAUSED) {
+			int tmp;
 			debug2("IO thread paused: %d", io->state);
 			sigwait(&sigset, &tmp);
+			if (pcm->io_ptr == -1)
+				continue;
+			if (pcm->ba_pcm_fd == -1)
+				goto fail;
 			asrsync_init(&asrs, io->rate);
 			debug2("IO thread resumed: %d", io->state);
+			if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+				debug2("Waiting for first period of frames");
+				playback_wait_first_period(io);
+			}
 		}
+
+		if (io->state == SND_PCM_STATE_DISCONNECTED)
+			goto fail;
 
 		snd_pcm_uframes_t io_ptr = pcm->io_ptr;
 		snd_pcm_uframes_t io_buffer_size = io->buffer_size;
@@ -253,7 +263,6 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
 			/* check for under-run and act accordingly */
 			if (io_hw_ptr > io->appl_ptr) {
-				io->state = SND_PCM_STATE_XRUN;
 				io_ptr = -1;
 				goto sync;
 			}
@@ -311,7 +320,6 @@ static int bluealsa_start(snd_pcm_ioplug_t *io) {
 	 * we might end up with a bunch of IO threads reading or writing to the
 	 * same FIFO simultaneously. Instead, just send resume signal. */
 	if (pcm->io_started) {
-		io->state = SND_PCM_STATE_RUNNING;
 		pthread_kill(pcm->io_thread, SIGIO);
 		return 0;
 	}
@@ -324,19 +332,11 @@ static int bluealsa_start(snd_pcm_ioplug_t *io) {
 		return -errno;
 	}
 
-	/* State has to be updated before the IO thread is created - if the state
-	 * does not indicate "running", the IO thread will be suspended until the
-	 * "resume" signal is delivered. This requirement is only (?) theoretical,
-	 * anyhow forewarned is forearmed. */
-	snd_pcm_state_t prev_state = io->state;
-	io->state = SND_PCM_STATE_RUNNING;
-
 	pcm->io_started = true;
 	if ((errno = pthread_create(&pcm->io_thread, NULL,
 					PTHREAD_ROUTINE(io_thread), io)) != 0) {
 		debug2("Couldn't create IO thread: %s", strerror(errno));
 		pcm->io_started = false;
-		io->state = prev_state;
 		return -errno;
 	}
 
@@ -488,7 +488,6 @@ static int bluealsa_pause(snd_pcm_ioplug_t *io, int enable) {
 		return -errno;
 
 	if (enable == 0) {
-		io->state = SND_PCM_STATE_RUNNING;
 		pthread_kill(pcm->io_thread, SIGIO);
 	}
 
