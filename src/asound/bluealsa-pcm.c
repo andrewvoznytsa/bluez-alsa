@@ -148,7 +148,7 @@ static void playback_wait_first_period(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	while (io->appl_ptr < pcm->avail_min &&
 	            (io->state == SND_PCM_STATE_RUNNING ||
- 	             io->state == SND_PCM_STATE_PREPARED)) {
+	             io->state == SND_PCM_STATE_PREPARED)) {
 		uint64_t nsec =
 		            (pcm->avail_min - io->appl_ptr) * NSEC_PER_SEC / io->rate;
 		struct timespec ts = {
@@ -228,6 +228,22 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		if (io_buffer_size - io_ptr < frames)
 			frames = io_buffer_size - io_ptr;
 
+		/* Do not try to transfer more frames than are available in the ring
+		 * buffer ! */
+		snd_pcm_uframes_t hw_avail = snd_pcm_ioplug_hw_avail(io, io_hw_ptr,
+		                                                         io->appl_ptr);
+		if (frames > hw_avail)
+			frames = hw_avail;
+
+		/* there are 2 reasons why the number of available frames may be zero:
+		 * xrun or drained final samples - ioplug will determine which, we just
+		 * need to set the hw pointer to -1 */
+		if (frames == 0) {
+			io_ptr = -1;
+			io_hw_ptr = -1;
+			goto sync;
+		}
+
 		/* IO operation size in bytes */
 		len = frames * pcm->frame_size;
 
@@ -259,12 +275,6 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
 		}
 		else {
-
-			/* check for under-run and act accordingly */
-			if (io_hw_ptr > io->appl_ptr) {
-				io_ptr = -1;
-				goto sync;
-			}
 
 			/* Perform atomic write - see the explanation above. */
 			do {
