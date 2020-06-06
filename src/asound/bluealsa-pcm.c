@@ -210,8 +210,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		 * transfer has been completed. We use a temporary copy during the
 		 * transfer procedure */
 		snd_pcm_uframes_t io_hw_ptr = pcm->hw_ptr;
-		snd_pcm_uframes_t offset = io_hw_ptr % io->buffer_size;
 
+		snd_pcm_uframes_t offset = io_hw_ptr % io->buffer_size;
 		snd_pcm_uframes_t frames = pcm->avail_min;
 		char *head = pcm->buffer + offset * pcm->frame_size;
 
@@ -609,13 +609,15 @@ static int bluealsa_poll_descriptors(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 		unsigned int nfds, unsigned short *revents) {
 	struct bluealsa_pcm *pcm = io->private_data;
+	*revents = 0;
+	int ret = 0;
 
 	if (bluealsa_dbus_connection_poll_dispatch(&pcm->dbus_ctx, &pfd[1], nfds - 1))
 		while (dbus_connection_dispatch(pcm->dbus_ctx.conn) == DBUS_DISPATCH_DATA_REMAINS)
 			continue;
 
 	if (pcm->ba_pcm_fd == -1)
-		return -ENODEV;
+		goto fail;
 
 	if (pfd[0].revents & POLLIN) {
 
@@ -625,36 +627,50 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 		if (event & 0xDEAD0000)
 			goto fail;
 
+		/* This call synchronizes the ring buffer pointers and updates the
+		 * ioplug state. */
+		snd_pcm_uframes_t avail = snd_pcm_avail(io->pcm);
+
 		/* ALSA expects that the event will match stream direction, e.g.
 		 * playback will not start if the event is for reading. */
 		*revents = io->stream == SND_PCM_STREAM_CAPTURE ? POLLIN : POLLOUT;
 
-		/* Include POLLERR if PCM is not prepared, running or draining.
-		 * Also restore the event trigger as in this state the io thread is
-		 * not active to do it */
-		if (io->state != SND_PCM_STATE_PREPARED &&
-			 io->state != SND_PCM_STATE_RUNNING &&
-			 io->state != SND_PCM_STATE_DRAINING) {
-			*revents |= POLLERR;
-			eventfd_write(pcm->event_fd, 1);
-		}
+		/* We hold the event fd ready, unless insufficient frames are
+		 * available in the ring buffer */
+		bool ready = true;
 
-		/* a playback application may write less than start_threshold frames on
-		 * its first write and then wait in poll() forever because the event_fd
-		 * never gets written to again.
-		 * To prevent this possibility, we bump the internal trigger. */
-		else if (snd_pcm_stream(io->pcm) == SND_PCM_STREAM_PLAYBACK &&
-			io->state == SND_PCM_STATE_PREPARED)
-			eventfd_write(pcm->event_fd, 1);
+		switch (io->state) {
+			case SND_PCM_STATE_SETUP:
+				ready = false;
+				*revents = 0;
+				break;
+			case SND_PCM_STATE_RUNNING:
+				if (avail < pcm->avail_min) {
+					ready = false;
+					*revents = 0;
+				}
+				break;
+			case SND_PCM_STATE_XRUN:
+			case SND_PCM_STATE_PAUSED:
+			case SND_PCM_STATE_SUSPENDED:
+				*revents = POLLERR;
+				break;
+			case SND_PCM_STATE_DISCONNECTED:
+				*revents = POLLERR;
+				ret = -ENODEV;
+				break;
+			case SND_PCM_STATE_OPEN:
+				*revents = POLLERR;
+				ret = -EBADF;
+				break;
+			default:
+				break;
+		};
 
-		/* If the event was triggered prematurely, wait for another one. */
-		else if (snd_pcm_avail_update(io->pcm) < pcm->avail_min)
-			*revents = 0;
+		if (ready)
+			eventfd_write(pcm->event_fd, 1);
 	}
-	else
-		*revents = 0;
-
-	return 0;
+	return ret;
 
 fail:
 	*revents = POLLERR | POLLHUP;
