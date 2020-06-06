@@ -195,12 +195,12 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 				continue;
 			if (pcm->ba_pcm_fd == -1)
 				goto fail;
-			asrsync_init(&asrs, io->rate);
-			debug2("IO thread resumed: %d", io->state);
 			if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 				debug2("Waiting for first period of frames");
 				playback_wait_first_period(io);
 			}
+			asrsync_init(&asrs, io->rate);
+			debug2("IO thread resumed: %d", io->state);
 		}
 
 		if (io->state == SND_PCM_STATE_DISCONNECTED)
