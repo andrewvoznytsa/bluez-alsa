@@ -83,6 +83,8 @@ struct bluealsa_pcm {
 	unsigned int delay_pcm_nread;
 	bool delay_valid;
 
+	/* permit the application to modify the frequency of poll() events */
+	volatile snd_pcm_uframes_t avail_min;
 };
 
 /**
@@ -153,9 +155,9 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 			 * it should take for a real-time application to write the balance
 			 * of the period. */
 			if (!started && io->stream == SND_PCM_STREAM_PLAYBACK) {
-				if (io->period_size > io->appl_ptr) {
+				if (pcm->avail_min > io->appl_ptr) {
 					struct timespec ts = {
-						.tv_nsec = (io->period_size - io->appl_ptr) * 1000000000 / io->rate };
+						.tv_nsec = (pcm->avail_min - io->appl_ptr) * 1000000000 / io->rate };
 					debug2("IO thread started with insufficient frames - pausing for %ld ms", ts.tv_nsec / 1000000);
 					sigtimedwait(&sigset, NULL, &ts);
 					asrsync_init(&asrs, io->rate);
@@ -182,7 +184,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		snd_pcm_uframes_t io_buffer_size = io->buffer_size;
 		snd_pcm_uframes_t io_hw_ptr = pcm->io_hw_ptr;
 		snd_pcm_uframes_t io_hw_boundary = pcm->io_hw_boundary;
-		snd_pcm_uframes_t frames = io->period_size;
+		snd_pcm_uframes_t frames = pcm->avail_min;
 		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
 		char *buffer = (char *)areas->addr + (areas->first + areas->step * io_ptr) / 8;
 		char *head = buffer;
@@ -394,6 +396,9 @@ static int bluealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 		debug2("FIFO buffer size: %zd", pcm->ba_pcm_buffer_size);
 	}
 
+	/* alsa default for avail_min is one period */
+	pcm->avail_min = io->period_size;
+
 	debug2("Selected HW buffer: %zd periods x %zd bytes %c= %zd bytes",
 			io->buffer_size / io->period_size, pcm->frame_size * io->period_size,
 			io->period_size * (io->buffer_size / io->period_size) == io->buffer_size ? '=' : '<',
@@ -414,6 +419,16 @@ static int bluealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Initializing SW");
 	snd_pcm_sw_params_get_boundary(params, &pcm->io_hw_boundary);
+	snd_pcm_uframes_t avail_min;
+	snd_pcm_sw_params_get_avail_min(params, &avail_min);
+	if (avail_min != pcm->avail_min) {
+		if (avail_min > io->buffer_size)
+			return -EINVAL;
+		else {
+			debug2("changing avail_min: %zu", avail_min);
+			pcm->avail_min = avail_min;
+		}
+	}
 	return 0;
 }
 
@@ -591,7 +606,7 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 			eventfd_write(pcm->event_fd, 1);
 
 		/* If the event was triggered prematurely, wait for another one. */
-		else if (!snd_pcm_avail_update(io->pcm))
+		else if (snd_pcm_avail_update(io->pcm) < pcm->avail_min)
 			*revents = 0;
 	}
 	else
