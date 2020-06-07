@@ -41,6 +41,12 @@
 #define NSEC_PER_SEC 1000000000
 
 
+enum ba_pause_state {
+	BA_PAUSE_OFF,
+	BA_PAUSE_PENDING,
+	BA_PAUSE_ON
+};
+
 struct bluealsa_pcm {
 	snd_pcm_ioplug_t io;
 
@@ -81,6 +87,12 @@ struct bluealsa_pcm {
 
 	/* permit the application to modify the frequency of poll() events */
 	volatile snd_pcm_uframes_t avail_min;
+
+	/* synchronize threads to begin/end pause */
+	pthread_mutex_t pause_mutex;
+	pthread_cond_t pause_cond;
+	enum ba_pause_state paused;
+
 };
 
 /**
@@ -187,7 +199,16 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	debug2("Starting IO loop: %d", pcm->ba_pcm_fd);
 	for (;;) {
 
-		if (pcm->hw_ptr == -1 || io->state == SND_PCM_STATE_PAUSED) {
+		/* synchronize with application thread to ensure it does not pause the
+		 * server while we are processing a transfer */
+		if (pcm->paused == BA_PAUSE_PENDING) {
+			pthread_mutex_lock(&pcm->pause_mutex);
+			pcm->paused = BA_PAUSE_ON;
+			pthread_cond_signal(&pcm->pause_cond);
+			pthread_mutex_unlock(&pcm->pause_mutex);
+		}
+
+		if (pcm->hw_ptr == -1 || pcm->paused == BA_PAUSE_ON) {
 			int tmp;
 			debug2("IO thread paused: %d", io->state);
 			sigwait(&sigset, &tmp);
@@ -195,7 +216,13 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 				continue;
 			if (pcm->ba_pcm_fd == -1)
 				goto fail;
-			if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+			if (pcm->paused == BA_PAUSE_ON) {
+				pthread_mutex_lock(&pcm->pause_mutex);
+				pcm->paused = BA_PAUSE_OFF;
+				pthread_cond_signal(&pcm->pause_cond);
+				pthread_mutex_unlock(&pcm->pause_mutex);
+			}
+			else if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 				debug2("Waiting for first period of frames");
 				playback_wait_first_period(io);
 			}
@@ -386,6 +413,8 @@ static int bluealsa_close(snd_pcm_ioplug_t *io) {
 	bluealsa_dbus_connection_ctx_free(&pcm->dbus_ctx);
 	close(pcm->event_fd);
 	pthread_mutex_destroy(&pcm->delay_mutex);
+	pthread_cond_destroy(&pcm->pause_cond);
+	pthread_mutex_destroy(&pcm->delay_mutex);
 	free(pcm);
 	return 0;
 }
@@ -489,12 +518,24 @@ static int bluealsa_drain(snd_pcm_ioplug_t *io) {
 static int bluealsa_pause(snd_pcm_ioplug_t *io, int enable) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
+	if (enable == 1) {
+		pthread_mutex_lock(&pcm->pause_mutex);
+		pcm->paused = BA_PAUSE_PENDING;
+		while (pcm->paused != BA_PAUSE_ON)
+			pthread_cond_wait(&pcm->pause_cond, &pcm->pause_mutex);
+		pthread_mutex_unlock(&pcm->pause_mutex);
+	}
+
 	if (!bluealsa_dbus_pcm_ctrl_send(pcm->ba_pcm_ctrl_fd,
 				enable ? "Pause" : "Resume", NULL))
 		return -errno;
 
 	if (enable == 0) {
 		pthread_kill(pcm->io_thread, SIGIO);
+		pthread_mutex_lock(&pcm->pause_mutex);
+		while (pcm->paused != BA_PAUSE_OFF)
+			pthread_cond_wait(&pcm->pause_cond, &pcm->pause_mutex);
+		pthread_mutex_unlock(&pcm->pause_mutex);
 	}
 
 	/* Even though PCM transport is paused, our IO thread is still running. If
@@ -859,6 +900,9 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	pcm->ba_pcm_ctrl_fd = -1;
 	pcm->delay_ex = delay;
 	pthread_mutex_init(&pcm->delay_mutex, NULL);
+	pthread_mutex_init(&pcm->pause_mutex, NULL);
+	pthread_cond_init(&pcm->pause_cond, NULL);
+	pcm->paused = BA_PAUSE_OFF;
 
 	dbus_threads_init_default();
 
