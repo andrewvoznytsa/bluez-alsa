@@ -158,7 +158,7 @@ int sco_setup_connection_dispatcher(struct ba_adapter *a) {
 	/* XXX: It is a known issue with Broadcom chips, that by default, the SCO
 	 *      packets are routed via the chip's PCM interface. However, the IO
 	 *      thread expects data to be available via the transport interface. */
-	if (a->chip.manufacturer == BT_COMPID_BROADCOM) {
+	if (false) {
 
 		int dd;
 		uint8_t routing, clock, frame, sync, clk;
